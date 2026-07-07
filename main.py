@@ -2,8 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-KRISHNA KILLING SPREE — MAIN.PY (REESCRITURA COMPLETA)
-Arquitectura limpia, estado único, robustez para ejecución continua.
+KRISHNA KILLING SPREE — MAIN.PY (VERSIÓN CORREGIDA)
+Correcciones aplicadas:
+1. PnL % usa capital real (no CAPITAL_INICIAL=100)
+2. TP/SL validados antes de enviar (evita rechazos por TP=entry)
+3. Distancia mínima TP/SL = 1% del entry (evita stops demasiado ajustados)
+4. Break-Even y Timeout funcionan correctamente
 """
 
 import os
@@ -23,7 +27,7 @@ from risk import RiskController
 from utils import log_info, log_warning, log_error, log_debug, log_success
 
 # ============================================================
-# CONFIGURACIÓN
+# CONFIGURACIÓN (importar parámetros)
 # ============================================================
 from config import (
     SYMBOLS, CAPITAL_INICIAL, BASE_LEVERAGE, MIN_SCORE,
@@ -46,12 +50,11 @@ class PositionState:
     entry_time: float  # timestamp Unix (segundos)
     current_price: float
     pnl_usdt: float
+    capital: float = CAPITAL_INICIAL  # 🔥 CORREGIDO: usa capital real
     open: bool = True
 
     @classmethod
     def from_okx(cls, position: Dict, capital: float) -> 'PositionState':
-        """Crea PositionState desde la respuesta de OKX."""
-        entry_time = None
         cTime = position.get('cTime')
         if cTime:
             try:
@@ -69,35 +72,32 @@ class PositionState:
             entry_time=entry_time,
             current_price=safe_float(position.get('markPx', position.get('avgPx'))),
             pnl_usdt=safe_float(position.get('upl')),
+            capital=capital,
             open=True
         )
 
     @property
     def elapsed_minutes(self) -> float:
-        """Minutos transcurridos desde la apertura."""
         return (time.time() - self.entry_time) / 60.0
 
     @property
     def pnl_pct(self) -> float:
-        """PnL como porcentaje del capital."""
-        return (self.pnl_usdt / CAPITAL_INICIAL) * 100 if CAPITAL_INICIAL > 0 else 0
+        # 🔥 CORREGIDO: usa el capital real, no CAPITAL_INICIAL
+        return (self.pnl_usdt / self.capital) * 100 if self.capital > 0 else 0
 
     @property
     def is_profitable(self) -> bool:
-        """Si el PnL neto (después de comisiones) es positivo."""
-        fees_slippage = 0.0010  # 0.10%
+        fees_slippage = 0.0010
         total_costs = fees_slippage + (BREAK_EVEN_BUFFER / 100.0)
         net_pnl = (self.pnl_pct / 100.0) - total_costs
         return net_pnl > 0
 
     @property
     def should_break_even(self) -> bool:
-        """Si debe cerrarse por break-even positivo."""
         return (self.elapsed_minutes >= BREAK_EVEN_MINUTES and self.is_profitable)
 
     @property
     def should_timeout(self) -> bool:
-        """Si debe cerrarse por timeout."""
         return self.elapsed_minutes >= MAX_HOLD_MINUTES
 
     def to_dict(self) -> Dict:
@@ -289,6 +289,10 @@ class KrishnaKillingSpree:
                 log_error(f"Error obteniendo info de {sym}: {e}")
                 self.stats['invalid_symbols'] += 1
 
+        # Establecer apalancamiento
+        for sym in SYMBOLS:
+            self.exchange.set_leverage(sym, BASE_LEVERAGE)
+
         self.risk = RiskController(self.capital)
         log_info(f"Universo: {len(SYMBOLS)} activos (válidos: {sum(1 for v in self.valid_instruments.values() if v)})")
         log_info(f"Apalancamiento base: {BASE_LEVERAGE}x")
@@ -327,15 +331,24 @@ class KrishnaKillingSpree:
     # ============================================================
     # GESTIÓN DE POSICIÓN (ACTUALIZAR DESDE OKX)
     # ============================================================
+    def _update_capital_from_balance(self) -> None:
+        """Actualiza el capital desde el balance de OKX."""
+        bal = self.exchange.get_balance()
+        if bal.get('ok'):
+            data = bal.get('data', [])
+            for detail in data:
+                for asset in detail.get('details', []):
+                    if asset.get('ccy') == 'USDT':
+                        self.capital = safe_float(asset.get('eq'))
+                        log_debug(f"[DIAG] Capital actualizado: {self.capital:.2f} USDT")
+                        return
+
     def _update_position_from_okx(self, position_data: Dict) -> PositionState:
-        """Actualiza el estado de la posición desde OKX."""
+        """Crea PositionState usando el capital actual."""
+        self._update_capital_from_balance()
         return PositionState.from_okx(position_data, self.capital)
 
     def _close_position(self, pos: PositionState, reason: str) -> bool:
-        """
-        Cierra una posición y verifica la respuesta de OKX.
-        Retorna True si el cierre fue exitoso.
-        """
         log_info(f"⏰ Cerrando por {reason} (tiempo: {pos.elapsed_minutes:.1f} min, PnL: {pos.pnl_usdt:.2f} USDT)")
 
         close_side = "sell" if pos.side == "long" else "buy"
@@ -352,7 +365,6 @@ class KrishnaKillingSpree:
     # GENERACIÓN DE SEÑAL
     # ============================================================
     def _get_signal(self) -> Optional[Tuple[str, float, Dict]]:
-        """Genera una señal de trading."""
         features_dict = {}
         for sym in SYMBOLS:
             if not self.valid_instruments.get(sym, False):
@@ -381,8 +393,10 @@ class KrishnaKillingSpree:
 
         return self.strategy.select_top_asset(features_dict)
 
+    # ============================================================
+    # EJECUCIÓN DE TRADE (CORREGIDA — VALIDACIÓN TP/SL)
+    # ============================================================
     def _execute_trade(self, symbol: str, score: float, features: Dict, risk_params: Dict) -> bool:
-        """Ejecuta un trade y retorna True si tuvo éxito."""
         try:
             ticker = self.exchange._request("GET", "/api/v5/market/ticker", params={"instId": symbol})
             if not ticker.get('ok') or not ticker.get('data'):
@@ -402,8 +416,8 @@ class KrishnaKillingSpree:
             ct_val = info.get('ct_val', 0.01)
             lot_sz = info.get('lot_size', 0.001)
             min_sz = info.get('min_sz', 0.001)
+            tick_size = info.get('tick_size', 0.01)
 
-            # Tamaño de posición
             available = self.capital * 0.85
             desired_notional = available * risk_params['leverage'] * risk_params['size_factor']
             size = desired_notional / (entry * ct_val)
@@ -413,17 +427,31 @@ class KrishnaKillingSpree:
                 log_error(f"Tamaño inválido para {symbol}: {size}")
                 return False
 
-            # TP y SL
             atr = features.get('atr', entry * 0.01)
             tp_base = entry + atr * TP_MULT if side == 'buy' else entry - atr * TP_MULT
             sl_base = entry - atr * SL_MULT if side == 'buy' else entry + atr * SL_MULT
 
-            tick_size = info.get('tick_size', 0.01)
+            # Redondear al tick_size
             tp_price = round(tp_base / tick_size) * tick_size
             sl_price = round(sl_base / tick_size) * tick_size
 
-            # Distancia mínima
-            min_distance = entry * 0.01
+            # 🔥 CORRECCIÓN 1: Validar que TP/SL no sean iguales al entry
+            if abs(tp_price - entry) < tick_size:
+                if side == 'buy':
+                    tp_price = entry + tick_size
+                else:
+                    tp_price = entry - tick_size
+                log_debug(f"[DIAG] TP ajustado de {tp_base:.2f} a {tp_price:.2f} (era igual al entry)")
+
+            if abs(sl_price - entry) < tick_size:
+                if side == 'buy':
+                    sl_price = entry - tick_size
+                else:
+                    sl_price = entry + tick_size
+                log_debug(f"[DIAG] SL ajustado de {sl_base:.2f} a {sl_price:.2f} (era igual al entry)")
+
+            # 🔥 CORRECCIÓN 2: Distancia mínima de 1% del entry
+            min_distance = entry * 0.01  # 1%
             if side == 'buy':
                 if tp_price <= entry + min_distance:
                     tp_price = entry + min_distance * 2
@@ -435,18 +463,47 @@ class KrishnaKillingSpree:
                 if sl_price <= entry + min_distance:
                     sl_price = entry + min_distance * 2
 
+            # Redondear nuevamente después de ajustes
+            tp_price = round(tp_price / tick_size) * tick_size
+            sl_price = round(sl_price / tick_size) * tick_size
+
+            # 🔥 CORRECCIÓN 3: Asegurar que TP > entry y SL < entry (para long)
+            if side == 'buy':
+                if tp_price <= entry:
+                    tp_price = entry + tick_size * 2
+                    log_debug(f"[DIAG] TP forzado a {tp_price:.2f} (mayor que entry)")
+                if sl_price >= entry:
+                    sl_price = entry - tick_size * 2
+                    log_debug(f"[DIAG] SL forzado a {sl_price:.2f} (menor que entry)")
+            else:  # short
+                if tp_price >= entry:
+                    tp_price = entry - tick_size * 2
+                    log_debug(f"[DIAG] TP forzado a {tp_price:.2f} (menor que entry)")
+                if sl_price <= entry:
+                    sl_price = entry + tick_size * 2
+                    log_debug(f"[DIAG] SL forzado a {sl_price:.2f} (mayor que entry)")
+
             log_info(f"📈 TRADE: {symbol} | {side.upper()} | Entry: {entry:.2f} | Size: {size:.4f} | TP: {tp_price:.2f} | SL: {sl_price:.2f}")
 
             order_res = self.exchange.place_market_order_with_tp_sl(symbol, side, size, tp_price, sl_price)
 
             if not order_res.get('ok'):
+                # Verificar si la posición se abrió a pesar del error
+                log_warning(f"⚠️ OKX devolvió error, verificando si la posición se abrió...")
+                time.sleep(1)
+                positions = self.exchange.get_positions(symbol)
+                if positions.get('ok'):
+                    for p in positions.get('data', []):
+                        if safe_float(p.get('pos', 0)) > 0:
+                            log_warning(f"⚠️ La orden se ejecutó aunque OKX devolvió error")
+                            self.trades_count += 1
+                            log_success(f"✅ Trade ejecutado en {symbol} (a pesar del error)")
+                            return True
                 log_error(f"Error en market order: {order_res.get('error')}")
                 return False
 
             self.trades_count += 1
             log_success(f"✅ Trade ejecutado en {symbol}")
-
-            # La posición se detectará en el próximo ciclo de monitoreo
             return True
 
         except Exception as e:
@@ -458,7 +515,6 @@ class KrishnaKillingSpree:
     # PNL Y MÉTRICAS
     # ============================================================
     def _update_capital_from_balance(self) -> None:
-        """Actualiza el capital desde el balance de OKX."""
         bal = self.exchange.get_balance()
         if bal.get('ok'):
             data = bal.get('data', [])
@@ -469,10 +525,8 @@ class KrishnaKillingSpree:
                         return
 
     def _record_pnl(self, pnl_usdt: float, reason: str) -> None:
-        """Registra el PnL de un trade cerrado."""
         if abs(pnl_usdt) < 0.01:
             return
-
         self.pnl_total += pnl_usdt
         self._append_pnl_row(self.capital, self.pnl_total, pnl_usdt, self.trades_count, self.risk.mode, reason)
         log_info(f"📈 PnL ({reason}): {pnl_usdt:.2f} USDT | PnL total: {self.pnl_total:.2f} USDT")
@@ -538,10 +592,9 @@ class KrishnaKillingSpree:
         log_info("=" * 60)
 
     # ============================================================
-    # BUCLE PRINCIPAL (REESCRITO)
+    # BUCLE PRINCIPAL
     # ============================================================
     def run(self) -> Dict:
-        """Bucle principal — limpio, determinístico, robusto."""
         log_info("🔥 KRISHNA KILLING SPREE — INICIO (MODO CONTINUO)")
 
         if not self.init():
@@ -556,47 +609,36 @@ class KrishnaKillingSpree:
 
         log_info("🔄 Bucle principal iniciado. Esperando oportunidades...")
 
-        # Solo una variable de estado: self.position
         self.position = None
 
         while True:
             try:
-                # ══════════════════════════════════════════════════════════
                 # 1. OBTENER POSICIONES DE OKX (FUENTE DE VERDAD)
-                # ══════════════════════════════════════════════════════════
                 positions = self.exchange.get_positions()
                 pos_data = positions.get('data', []) if positions.get('ok') else []
                 active_positions = [p for p in pos_data if safe_float(p.get('pos', 0)) > 0]
 
-                # ══════════════════════════════════════════════════════════
                 # 2. ACTUALIZAR RIESGO (cada 60 segundos)
-                # ══════════════════════════════════════════════════════════
                 now = time.time()
                 if now - self.last_risk_update > 60:
                     self._update_capital_from_balance()
                     self.risk.update(self.capital)
                     self.last_risk_update = now
 
-                # ══════════════════════════════════════════════════════════
                 # 3. SI HAY POSICIÓN ACTIVA → MONITOREAR
-                # ══════════════════════════════════════════════════════════
                 if active_positions:
-                    # 3a. Actualizar estado desde OKX
                     new_pos = self._update_position_from_okx(active_positions[0])
 
-                    # Si no había posición previamente, loguear apertura
                     if self.position is None:
                         log_info(f"📊 Posición activa: {new_pos.symbol} (entry: {new_pos.entry_price:.2f})")
                         log_info(f"⏰ Abierta a las: {datetime.fromtimestamp(new_pos.entry_time).isoformat()}")
 
                     self.position = new_pos
 
-                    # 3b. Mostrar PnL cada 30 segundos
                     if now - self.last_position_check > EVALUATION_INTERVAL:
                         log_info(f"💹 PnL: {self.position.pnl_usdt:.2f} USDT ({self.position.pnl_pct:.2f}%) | "
                                  f"Tiempo: {self.position.elapsed_minutes:.1f} min")
 
-                        # 3c. Evaluar cierre por tiempo
                         should_close = False
                         close_reason = ""
 
@@ -611,10 +653,8 @@ class KrishnaKillingSpree:
                             log_info(f"[DIAG] Timeout activado: tiempo {self.position.elapsed_minutes:.1f} min")
 
                         if should_close:
-                            # 3d. Intentar cerrar
                             success = self._close_position(self.position, close_reason)
                             if success:
-                                # Guardar PnL antes de limpiar
                                 pnl_usdt = self.position.pnl_usdt
                                 self._record_pnl(pnl_usdt, close_reason)
                                 self.position = None
@@ -624,23 +664,17 @@ class KrishnaKillingSpree:
 
                         self.last_position_check = now
 
-                    # Esperar antes de volver a verificar
                     time.sleep(5)
                     continue
 
-                # ══════════════════════════════════════════════════════════
                 # 4. NO HAY POSICIÓN → LIMPIAR Y BUSCAR SEÑAL
-                # ══════════════════════════════════════════════════════════
                 if self.position is not None:
-                    # La posición se cerró fuera del bot (TP/SL manual)
                     log_info("✅ Posición cerrada (detectada en OKX)")
                     self.position = None
-                    # Actualizar capital
                     self._update_capital_from_balance()
 
                 time.sleep(2)
 
-                # 4a. Verificar si hay señal
                 signal = self._get_signal()
                 if signal is None:
                     log_debug("No se encontraron señales válidas. Esperando...")
@@ -649,25 +683,21 @@ class KrishnaKillingSpree:
 
                 symbol, score, features = signal
 
-                # 4b. Verificar cooldown
                 if self.strategy.is_on_cooldown(symbol):
                     log_debug(f"{symbol} en cooldown")
                     time.sleep(5)
                     continue
 
-                # 4c. Verificar si el riesgo permite operar
                 risk_params = self.risk.get_effective_parameters()
                 if not risk_params['trading_enabled']:
                     log_debug("Trading deshabilitado por modo de riesgo")
                     time.sleep(5)
                     continue
 
-                # 4d. Ejecutar trade
                 success = self._execute_trade(symbol, score, features, risk_params)
                 if success:
                     self.strategy.set_cooldown(symbol)
                     log_info(f"🚀 Trade ejecutado en {symbol}. Esperando cierre...")
-                    # La posición se detectará en el próximo ciclo
                 else:
                     log_warning(f"❌ Falló la ejecución del trade en {symbol}")
                     time.sleep(5)

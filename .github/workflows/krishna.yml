@@ -1,0 +1,58 @@
+# .github/workflows/krishna.yml
+# ============================================================
+# EJECUCIÓN CONTINUA CON REINICIO CADA 5 HORAS
+# ============================================================
+
+name: Krishna Killing Spree
+
+on:
+  schedule:
+    - cron: "0 */5 * * *"   # Cada 5 horas (00:00, 05:00, 10:00, ...)
+  workflow_dispatch:
+
+concurrency:
+  group: krishna-bot
+  cancel-in-progress: true
+
+jobs:
+  run-bot:
+    name: Ejecutar Krishna Killing Spree
+    runs-on: ubuntu-latest
+    timeout-minutes: 360     # 6 horas (seguro, el cron reinicia a las 5h)
+
+    steps:
+      - name: ⬇️ Checkout
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 Instalar dependencias
+        run: |
+          pip install --upgrade pip
+          pip install requests numpy
+
+      - name: 📁 Crear directorios
+        run: |
+          mkdir -p metrics logs snapshots
+
+      - name: 🤖 Ejecutar Krishna Killing Spree
+        run: python main.py
+        env:
+          OKX_API_KEY: ${{ secrets.OKX_API_KEY }}
+          OKX_SECRET_KEY: ${{ secrets.OKX_SECRET_KEY }}
+          OKX_PASSPHRASE: ${{ secrets.OKX_PASSPHRASE }}
+          OKX_DEMO: ${{ secrets.OKX_DEMO || 'true' }}
+
+      - name: 📊 Subir artefactos
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: krishna-data-${{ github.run_id }}
+          path: |
+            metrics/
+            logs/
+            snapshots/
+          retention-days: 30
